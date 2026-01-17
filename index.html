@@ -1,0 +1,416 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Photo labels</title>
+  <style>
+    html, body { height: 100%; margin: 0; font-family: system-ui, sans-serif; background:#000; }
+    body { overflow: hidden; }
+
+    #toolbar{
+      position: fixed;
+      left: 10px;
+      top: 10px;
+      z-index: 50;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    #toggleBtn, #modeBtn, #resetBtn{
+      padding: 10px 12px;
+      border: 0;
+      border-radius: 10px;
+      background: rgba(0,0,0,0.78);
+      color: #fff;
+      font-size: 14px;
+    }
+
+    #labelBox{
+      position: fixed;
+      left: 0; right: 0; bottom: 0;
+      z-index: 50;
+      padding: 12px 14px;
+      background: rgba(0,0,0,0.78);
+      color: #fff;
+      font-size: 16px;
+      cursor: pointer;
+      user-select: none;
+    }
+    #labelBox.muted{ cursor: default; opacity: 0.9; }
+
+    #tip{
+      position: fixed;
+      z-index: 60;
+      padding: 6px 8px;
+      border-radius: 8px;
+      background: rgba(0,0,0,0.78);
+      color: #fff;
+      font-size: 14px;
+      pointer-events: none;
+      transform: translate(10px, 10px);
+      display: none;
+      max-width: 75vw;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    #stage{
+      position: fixed;
+      inset: 0;
+      overflow: hidden;
+      background: #000;
+      touch-action: none; /* custom pan/zoom surface (map-like) [web:257] */
+    }
+
+    #world{
+      position: absolute;
+      left: 0; top: 0;
+      transform-origin: 0 0;
+      will-change: transform;
+    }
+
+    #img{
+      position: absolute;
+      left: 0; top: 0;
+      display: block;
+      user-select: none;
+      -webkit-user-drag: none;
+      pointer-events: none;
+    }
+
+    #svg{
+      position: absolute;
+      left: 0; top: 0;
+      display: block;
+      pointer-events: none;     /* svg root ignores hits */
+    }
+    #polyLayer{ pointer-events: auto; } /* polygons receive hits */
+    .poly{
+      stroke: rgba(0,0,0,0.55);
+      stroke-width: 2;
+      vector-effect: non-scaling-stroke;
+      cursor: pointer;
+      pointer-events: auto;
+      fill: rgba(255, 200, 0, 0.18);
+    }
+    .poly.selected{
+      stroke: rgba(0, 200, 255, 1);
+      stroke-width: 4;
+      fill-opacity: 0.30;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="toolbar">
+    <button id="toggleBtn" type="button">Hide shapes</button>
+    <button id="modeBtn" type="button">Mode: Solo</button>
+    <button id="resetBtn" type="button">Reset view</button>
+  </div>
+
+  <div id="stage">
+    <div id="world">
+      <img id="img" src="assets/photo.jpg" alt="Annotated photo">
+      <svg id="svg">
+        <g id="polyLayer"></g>
+      </svg>
+    </div>
+  </div>
+
+  <div id="tip"></div>
+  <div id="labelBox" class="muted">Tap a Character . . . </div>
+
+<script>
+(async () => {
+  const FIXED_KEYWORD = "marvel comics character";
+  const USE_RANDOM_PASTELS = true;
+
+  const SEARCH_URL = (label) => {
+    const q = `${label} ${FIXED_KEYWORD}`.trim();
+    return `https://duckduckgo.com/?q=${encodeURIComponent(q)}&ia=images&iax=images`;
+  };
+
+  const stage = document.getElementById("stage");
+  const world = document.getElementById("world");
+  const img = document.getElementById("img");
+  const svg = document.getElementById("svg");
+  const polyLayer = document.getElementById("polyLayer");
+  const tip = document.getElementById("tip");
+  const labelBox = document.getElementById("labelBox");
+  const toggleBtn = document.getElementById("toggleBtn");
+  const modeBtn = document.getElementById("modeBtn");
+  const resetBtn = document.getElementById("resetBtn");
+
+  const data = await fetch("assets/photo.json").then(r => r.json());
+  console.log("Loaded shapes:", data.shapes?.length);
+
+  // Defaults
+  let overlaysEnabled = true;
+  let mode = "solo"; // solo|all|faint
+
+  let selectedEl = null;
+  let selectedLabel = null;
+
+  // Map transform
+  let tx = 0, ty = 0, s = 1;
+  const MIN_SCALE = 0.5;
+  const MAX_SCALE = 12;
+
+  // Pointer tracking [web:104]
+  const pointers = new Map(); // pointerId -> {x,y}
+  let gestureStart = null;
+
+  // Tap-vs-pan threshold
+  let downInfo = null; // {id, x, y, moved, target}
+  const TAP_SLOP_PX = 10;
+
+  function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+  function mid(a,b){ return { x:(a.x+b.x)/2, y:(a.y+b.y)/2 }; }
+  function dist(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
+
+  function applyTransform(){
+    world.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`;
+  }
+
+  function showTip(text, x, y){
+    tip.textContent = text;
+    tip.style.left = x + "px";
+    tip.style.top = y + "px";
+    tip.style.display = "block";
+  }
+  function hideTip(){ tip.style.display = "none"; }
+
+  function setSelected(el, label){
+    if (selectedEl) selectedEl.classList.remove("selected");
+    selectedEl = el;
+    selectedLabel = label;
+
+    if (selectedEl) selectedEl.classList.add("selected");
+
+    if (selectedLabel) {
+      labelBox.textContent = selectedLabel + "  (tap HERE to search for images)";
+      labelBox.classList.remove("muted");
+    } else {
+      labelBox.textContent = "Tap a character . . .";
+      labelBox.classList.add("muted");
+    }
+  }
+
+  function randomPastel(){
+    const h = Math.round(Math.random() * 360);
+    return `hsl(${h} 65% 85%)`;
+  }
+
+  function setPolyVisual(el, {fillOpacity, strokeOpacity}){
+    el.style.fillOpacity = fillOpacity;
+    el.style.strokeOpacity = strokeOpacity;
+  }
+
+  function applyVisibilityPolicy(){
+    const polys = polyLayer.querySelectorAll("polygon");
+    toggleBtn.textContent = overlaysEnabled ? "Hide shapes" : "Show shapes";
+
+    if (!overlaysEnabled) {
+      polys.forEach(p => setPolyVisual(p, { fillOpacity: 0, strokeOpacity: 0 }));
+      hideTip();
+      return;
+    }
+
+    if (mode === "all") {
+      polys.forEach(p => setPolyVisual(p, { fillOpacity: 0.18, strokeOpacity: 0.65 }));
+      return;
+    }
+
+    if (mode === "faint") {
+      polys.forEach(p => setPolyVisual(p, { fillOpacity: 0.06, strokeOpacity: 0.22 }));
+      if (selectedEl) setPolyVisual(selectedEl, { fillOpacity: 0.30, strokeOpacity: 1.0 });
+      return;
+    }
+
+    // solo
+    polys.forEach(p => setPolyVisual(p, { fillOpacity: 0, strokeOpacity: 0 }));
+    if (selectedEl) setPolyVisual(selectedEl, { fillOpacity: 0.30, strokeOpacity: 1.0 });
+  }
+
+  function setMode(next){
+    mode = next;
+    modeBtn.textContent =
+      (mode === "all") ? "Mode: All" :
+      (mode === "faint") ? "Mode: Faint" :
+      "Mode: Solo";
+    applyVisibilityPolicy();
+  }
+
+  // Default base layout: COVER
+  function coverToScreen(){
+    const vw = stage.clientWidth, vh = stage.clientHeight;
+    const iw = img.naturalWidth, ih = img.naturalHeight;
+
+    const baseScale = Math.max(vw / iw, vh / ih);
+    const dw = iw * baseScale;
+    const dh = ih * baseScale;
+
+    const baseX = (vw - dw) / 2;
+    const baseY = (vh - dh) / 2;
+
+    world.style.left = baseX + "px";
+    world.style.top = baseY + "px";
+    world.style.width = dw + "px";
+    world.style.height = dh + "px";
+
+    img.style.width = dw + "px";
+    img.style.height = dh + "px";
+
+    svg.setAttribute("width", dw);
+    svg.setAttribute("height", dh);
+    svg.setAttribute("viewBox", `0 0 ${data.imageWidth} ${data.imageHeight}`);
+
+    tx = 0; ty = 0; s = 1;
+    applyTransform();
+  }
+
+  function buildPolys(){
+    polyLayer.replaceChildren();
+
+    for (const shape of (data.shapes || [])) {
+      if (shape.shape_type !== "polygon") continue;
+
+      const pts = shape.points.map(([x,y]) => `${x},${y}`).join(" ");
+      const el = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+      el.setAttribute("points", pts);
+      el.setAttribute("class", "poly");
+      el.dataset.label = shape.label;
+
+      if (USE_RANDOM_PASTELS) el.style.fill = randomPastel();
+
+      // Start hidden in solo until selected
+      setPolyVisual(el, { fillOpacity: 0, strokeOpacity: 0 });
+
+      // No direct pointer handlers here (selection happens on stage pointerup)
+      polyLayer.appendChild(el);
+    }
+
+    setSelected(null, null);
+    applyVisibilityPolicy();
+  }
+
+  function polygonFromTarget(t){
+    // closest() finds nearest ancestor matching selector. [web:301]
+    return (t && t.closest) ? t.closest("polygon.poly") : null;
+  }
+
+  // --- Gesture handling with pointer capture on stage [web:285] ---
+  stage.addEventListener("pointerdown", (ev) => {
+    stage.setPointerCapture(ev.pointerId); // keep events even when starting on polygon [web:285]
+
+    pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+
+    if (pointers.size === 1) {
+      downInfo = { id: ev.pointerId, x: ev.clientX, y: ev.clientY, moved: false, target: ev.target };
+    } else {
+      downInfo = null;
+    }
+
+    const pts = [...pointers.values()];
+    gestureStart = {
+      tx, ty, s,
+      mid: (pts.length === 2) ? mid(pts[0], pts[1]) : null,
+      dist: (pts.length === 2) ? dist(pts[0], pts[1]) : null,
+    };
+  });
+
+  stage.addEventListener("pointermove", (ev) => {
+    if (!pointers.has(ev.pointerId)) return;
+
+    const prev = pointers.get(ev.pointerId);
+    const curr = { x: ev.clientX, y: ev.clientY };
+    pointers.set(ev.pointerId, curr);
+
+    if (downInfo && downInfo.id === ev.pointerId) {
+      const dx0 = curr.x - downInfo.x;
+      const dy0 = curr.y - downInfo.y;
+      if (Math.hypot(dx0, dy0) > TAP_SLOP_PX) downInfo.moved = true;
+    }
+
+    if (pointers.size === 1) {
+      tx += (curr.x - prev.x);
+      ty += (curr.y - prev.y);
+      applyTransform();
+      return;
+    }
+
+    if (pointers.size === 2) {
+      const [a, b] = [...pointers.values()];
+      const m = mid(a,b);
+      const d = dist(a,b);
+
+      if (!gestureStart || !gestureStart.dist) return;
+
+      const nextS = clamp(gestureStart.s * (d / gestureStart.dist), MIN_SCALE, MAX_SCALE);
+
+      const k = nextS / s;
+      tx = (tx - m.x) * k + m.x;
+      ty = (ty - m.y) * k + m.y;
+      s = nextS;
+
+      applyTransform();
+    }
+  });
+
+  stage.addEventListener("pointerup", (ev) => {
+    // Tap-to-select only if it didn't move
+    if (downInfo && downInfo.id === ev.pointerId && !downInfo.moved) {
+      const poly = polygonFromTarget(downInfo.target);
+      if (poly && overlaysEnabled) {
+        const label = poly.dataset.label;
+        if (selectedEl === poly) setSelected(null, null);
+        else setSelected(poly, label);
+        applyVisibilityPolicy();
+      }
+    }
+
+    pointers.delete(ev.pointerId);
+    if (pointers.size < 2) gestureStart = null;
+    downInfo = null;
+  });
+
+  stage.addEventListener("pointercancel", (ev) => {
+    pointers.delete(ev.pointerId);
+    if (pointers.size < 2) gestureStart = null;
+    downInfo = null;
+  });
+
+  // UI
+  toggleBtn.addEventListener("click", () => { overlaysEnabled = !overlaysEnabled; applyVisibilityPolicy(); });
+
+  modeBtn.addEventListener("click", () => {
+    const next = (mode === "solo") ? "all" : (mode === "all") ? "faint" : "solo";
+    setMode(next);
+  });
+
+  resetBtn.addEventListener("click", () => { tx = 0; ty = 0; s = 1; applyTransform(); });
+
+  labelBox.addEventListener("click", () => {
+    if (!selectedLabel) return;
+    window.open(SEARCH_URL(selectedLabel), "_blank");
+  });
+
+  // Init
+  function init(){
+    coverToScreen();
+    buildPolys();
+    setMode("solo");
+    overlaysEnabled = true;
+    applyVisibilityPolicy();
+  }
+
+  if (img.complete && img.naturalWidth > 0) init();
+  else img.addEventListener("load", init, { once: true });
+
+  window.addEventListener("resize", () => { coverToScreen(); buildPolys(); });
+})();
+</script>
+</body>
+</html>
